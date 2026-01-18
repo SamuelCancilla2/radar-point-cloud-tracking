@@ -62,6 +62,50 @@ python stdbscan_denoising_pipeline.py --low-memory --no-parallel
 python stdbscan_denoising_pipeline.py --max-frames 50 --no-viz
 ```
 
+## Running Experiments
+
+The `run_experiments.py` script automates parameter comparison by running multiple ST-DBSCAN configurations and generating a comparison report.
+
+### Quick Start
+
+Simply open `run_experiments.py` in your IDE and click **Run**. By default, it runs in quick mode with a single experiment.
+
+### Configuration
+
+Edit the settings at the top of the script:
+
+```python
+# Number of frames to process (lower = faster)
+MAX_FRAMES = 10
+
+# True = single quick test, False = run all experiments
+QUICK_MODE = True
+```
+
+### Command Line Usage
+
+```bash
+# Run with default settings (quick mode)
+python run_experiments.py
+```
+
+### Output
+
+The script generates:
+- `experiment_results.json` - Raw results data
+- `stdbscan_comparison_report.tex` - LaTeX report with comparison tables
+- `results_<experiment_name>/` - Output folder for each experiment
+
+### Experiment Configurations
+
+| Name | eps_space | eps_time | min_samples | min_frames | Description |
+|------|-----------|----------|-------------|------------|-------------|
+| default | 8.0 | 2.0 | 15 | 2 | Default parameters |
+| tight_spatial | 5.0 | 2.0 | 15 | 2 | Tighter spatial radius (5m) |
+| aggressive | 5.0 | 1.5 | 25 | 3 | Aggressive filtering |
+
+To add custom experiments, modify the `FULL_EXPERIMENTS` list in the script and set `QUICK_MODE = False`.
+
 ## Pipeline Stages
 
 ### Stage 1: Radar Data Loading
