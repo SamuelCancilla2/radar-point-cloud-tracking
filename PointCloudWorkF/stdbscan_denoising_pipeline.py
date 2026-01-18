@@ -49,6 +49,13 @@ try:
 except ImportError:
     HAS_MPL = False
 
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+    warnings.warn("Pillow not installed - GIF generation disabled. Install with: pip install Pillow")
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -67,6 +74,7 @@ MAX_WORKERS = min(4, os.cpu_count() or 1)  # Parallel workers for CSV loading
 DEFAULT_EPS_SPACE = 8.0       # Spatial neighborhood radius (meters)
 DEFAULT_EPS_TIME = 2.0        # Temporal neighborhood (frames)
 DEFAULT_MIN_SAMPLES = 15      # Minimum points to form a cluster
+DEFAULT_MIN_FRAMES = 2        # Minimum frames a cluster must span (filters transient noise)
 
 # Visualization
 PLOT_MAX_POINTS = 500_000     # Max points to plot
@@ -254,13 +262,20 @@ def load_frames_parallel(frames: List[Dict[int, Path]], max_workers: int = MAX_W
 # =============================================================================
 
 def st_dbscan(coords: np.ndarray, times: np.ndarray,
-              eps_space: float, eps_time: float, min_samples: int) -> np.ndarray:
+              eps_space: float, eps_time: float, min_samples: int,
+              min_frames: int = 2) -> np.ndarray:
     """
     Spatio-Temporal DBSCAN clustering (optimized).
 
     Points are neighbors if:
     1. Spatial distance <= eps_space
     2. Temporal distance <= eps_time
+
+    A point is a core point only if:
+    - It has >= min_samples neighbors satisfying above conditions
+    - Those neighbors span >= min_frames different frames (temporal persistence)
+
+    This filters out transient noise blobs that only appear in a single frame.
 
     Returns cluster labels (-1 = noise)
     """
@@ -286,55 +301,69 @@ def st_dbscan(coords: np.ndarray, times: np.ndarray,
         batch_neighbors = tree.query_radius(coords_f32[start:end], r=eps_space)
         spatial_neighbors.extend(batch_neighbors)
 
-    # Pre-convert times to float32 for faster comparisons
+    # Pre-convert times to int for frame counting
+    times_int = times.astype(np.int32, copy=False)
     times_f32 = times.astype(np.float32, copy=False)
 
+    def is_core_point(idx, neighbors):
+        """Check if point is a core point (enough neighbors spanning enough frames)."""
+        if len(neighbors) < min_samples:
+            return False
+        # Count unique frames among neighbors
+        neighbor_frames = times_int[neighbors]
+        unique_frames = len(np.unique(neighbor_frames))
+        return unique_frames >= min_frames
+
+    def get_st_neighbors(idx):
+        """Get spatio-temporal neighbors for a point."""
+        spatial_nb = spatial_neighbors[idx]
+        time_diffs = np.abs(times_f32[spatial_nb] - times_f32[idx])
+        return spatial_nb[time_diffs <= eps_time]
+
     cluster_id = 0
-    # Use numpy array as a queue (faster than Python set for this pattern)
-    queue = np.empty(n, dtype=np.int32)
+    # Track which points are queued to avoid duplicates
+    in_queue = np.zeros(n, dtype=bool)
 
     for i in range(n):
         if visited[i]:
             continue
         visited[i] = True
 
-        # Vectorized temporal filtering
-        spatial_nb = spatial_neighbors[i]
-        time_diffs = np.abs(times_f32[spatial_nb] - times_f32[i])
-        neighbors = spatial_nb[time_diffs <= eps_time]
+        # Get spatio-temporal neighbors
+        neighbors = get_st_neighbors(i)
 
-        if len(neighbors) < min_samples:
+        # Check if this is a core point (enough neighbors + temporal persistence)
+        if not is_core_point(i, neighbors):
             continue  # stays as noise (-1)
 
         # Start new cluster
         labels[i] = cluster_id
 
-        # Initialize queue with neighbors
-        queue_start = 0
-        queue_end = len(neighbors)
-        queue[:queue_end] = neighbors
+        # Use list as queue (simpler and safe)
+        queue = list(neighbors)
+        in_queue[neighbors] = True
 
-        while queue_start < queue_end:
-            pt = queue[queue_start]
-            queue_start += 1
+        while queue:
+            pt = queue.pop(0)
 
             if not visited[pt]:
                 visited[pt] = True
-                # Vectorized neighbor computation
-                pt_spatial_nb = spatial_neighbors[pt]
-                pt_time_diffs = np.abs(times_f32[pt_spatial_nb] - times_f32[pt])
-                pt_neighbors = pt_spatial_nb[pt_time_diffs <= eps_time]
+                # Get neighbors for this point
+                pt_neighbors = get_st_neighbors(pt)
 
-                if len(pt_neighbors) >= min_samples:
-                    # Add new neighbors to queue
+                # Only expand if this is also a core point
+                if is_core_point(pt, pt_neighbors):
+                    # Add new neighbors to queue (only if not already queued)
                     for nb in pt_neighbors:
-                        if not visited[nb] and labels[nb] == -1:
-                            queue[queue_end] = nb
-                            queue_end += 1
+                        if not visited[nb] and not in_queue[nb]:
+                            queue.append(nb)
+                            in_queue[nb] = True
 
             if labels[pt] == -1:
                 labels[pt] = cluster_id
 
+        # Reset in_queue for next cluster
+        in_queue[:] = False
         cluster_id += 1
 
     return labels
@@ -474,6 +503,263 @@ def plot_noise_reduction_stats(output_dir: Path, stats: dict) -> None:
     print(f"Saved: noise_reduction_stats.png")
 
 
+def track_clusters_across_frames(frames_data: List[dict], labels: np.ndarray,
+                                  frame_indices: np.ndarray, max_dist: float = 20.0) -> dict:
+    """
+    Track clusters across frames by matching centroids.
+    Returns a mapping from (frame_id, local_cluster_id) -> global_tracked_id
+    """
+    unique_frames = np.unique(frame_indices)
+
+    # Compute cluster centroids for each frame
+    frame_clusters = {}  # frame_id -> {cluster_id: (centroid_x, centroid_y, num_points)}
+    for frame_id in unique_frames:
+        mask = frame_indices == frame_id
+        frame_labels = labels[mask]
+        frame_x = np.concatenate([frames_data[frame_id]['x']])
+        frame_y = np.concatenate([frames_data[frame_id]['y']])
+
+        cluster_ids = np.unique(frame_labels[frame_labels >= 0])
+        centroids = {}
+        for cid in cluster_ids:
+            cmask = frame_labels == cid
+            centroids[cid] = (frame_x[cmask].mean(), frame_y[cmask].mean(), cmask.sum())
+        frame_clusters[frame_id] = centroids
+
+    # Track clusters across frames using greedy centroid matching
+    global_id_map = {}  # (frame_id, local_cluster_id) -> global_tracked_id
+    next_global_id = 0
+    prev_centroids = {}  # global_id -> (x, y)
+
+    for frame_id in unique_frames:
+        centroids = frame_clusters[frame_id]
+        used_global_ids = set()
+
+        # Match current clusters to previous frame's tracked clusters
+        matches = []
+        for local_id, (cx, cy, _) in centroids.items():
+            best_global_id = None
+            best_dist = max_dist
+
+            for global_id, (px, py) in prev_centroids.items():
+                if global_id in used_global_ids:
+                    continue
+                dist = np.sqrt((cx - px)**2 + (cy - py)**2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_global_id = global_id
+
+            matches.append((local_id, best_global_id, cx, cy))
+
+        # Assign global IDs
+        new_prev_centroids = {}
+        for local_id, best_global_id, cx, cy in matches:
+            if best_global_id is not None and best_global_id not in used_global_ids:
+                global_id = best_global_id
+                used_global_ids.add(global_id)
+            else:
+                global_id = next_global_id
+                next_global_id += 1
+
+            global_id_map[(frame_id, local_id)] = global_id
+            new_prev_centroids[global_id] = (cx, cy)
+
+        prev_centroids = new_prev_centroids
+
+    return global_id_map, next_global_id
+
+
+def create_comparison_gif(output_dir: Path, frames_data: List[dict],
+                          labels: np.ndarray, frame_indices: np.ndarray,
+                          fps: int = 2) -> None:
+    """
+    Create an animated GIF showing side-by-side comparison of raw vs clustered data
+    for each frame over time, with consistent cluster tracking and IDs.
+    """
+    if not HAS_MPL or not HAS_PIL:
+        print("matplotlib and Pillow required for GIF generation")
+        return
+
+    unique_frames = np.unique(frame_indices)
+
+    # Skip the first frame (often glitched)
+    if len(unique_frames) > 1:
+        unique_frames = unique_frames[1:]
+
+    num_frames = len(unique_frames)
+
+    if num_frames == 0:
+        print("No frames to animate")
+        return
+
+    print(f"  Creating comparison GIF with {num_frames} frames (skipping first frame)...")
+    print("    Tracking clusters across frames...")
+
+    # Track clusters across frames
+    global_id_map, total_tracked = track_clusters_across_frames(
+        frames_data, labels, frame_indices
+    )
+
+    # Temporary directory for frame images
+    temp_dir = output_dir / "_temp_frames"
+    temp_dir.mkdir(exist_ok=True)
+
+    # Calculate consistent axis limits across all frames
+    all_x = np.concatenate([fd['x'] for fd in frames_data if len(fd['x']) > 0])
+    all_y = np.concatenate([fd['y'] for fd in frames_data if len(fd['y']) > 0])
+    x_min, x_max = all_x.min(), all_x.max()
+    y_min, y_max = all_y.min(), all_y.max()
+    # Add padding
+    x_pad = (x_max - x_min) * 0.1
+    y_pad = (y_max - y_min) * 0.1
+    xlim = (x_min - x_pad, x_max + x_pad)
+    ylim = (y_min - y_pad, y_max + y_pad)
+
+    # Create color lookup table for tracked clusters (consistent colors)
+    cmap = plt.colormaps.get_cmap('tab20')
+    # Generate enough distinct colors
+    num_colors = max(20, total_tracked + 1)
+    tracked_colors = {}
+    for i in range(num_colors):
+        tracked_colors[i] = cmap(i % 20)[:3]
+
+    frame_paths = []
+
+    for idx, frame_id in enumerate(unique_frames):
+        fig, axes = plt.subplots(1, 2, figsize=(18, 7))  # Wider to fit legend outside
+
+        # Get frame data
+        frame_data = frames_data[frame_id]
+        x = frame_data['x']
+        y = frame_data['y']
+        z = frame_data['z']
+
+        # Get labels for this frame
+        mask = frame_indices == frame_id
+        frame_labels = labels[mask]
+
+        # Left panel: Raw point cloud (colored by intensity)
+        ax1 = axes[0]
+        if len(x) > 0:
+            z_norm = np.clip(z / z.max() if z.max() > 0 else z, 0, 1)
+            scatter1 = ax1.scatter(x, y, c=z_norm, cmap='viridis', s=1.5, alpha=0.7)
+            plt.colorbar(scatter1, ax=ax1, label='Intensity', shrink=0.7)
+        ax1.set_xlim(xlim)
+        ax1.set_ylim(ylim)
+        ax1.set_xlabel("X (meters)", fontsize=11)
+        ax1.set_ylabel("Y (meters)", fontsize=11)
+        ax1.set_title(f"Raw Point Cloud\n{len(x):,} points", fontsize=12)
+        ax1.set_aspect('equal')
+        ax1.grid(True, alpha=0.3)
+
+        # Right panel: ST-DBSCAN clustered with tracked IDs
+        ax2 = axes[1]
+        cluster_legend_items = []
+
+        if len(x) > 0 and len(frame_labels) == len(x):
+            noise_mask = frame_labels == -1
+            cluster_mask = ~noise_mask
+
+            # Plot noise points in gray
+            if noise_mask.any():
+                ax2.scatter(x[noise_mask], y[noise_mask], c='lightgray', s=1, alpha=0.3)
+                noise_count = noise_mask.sum()
+            else:
+                noise_count = 0
+
+            # Plot each cluster with tracked color and label
+            local_cluster_ids = np.unique(frame_labels[frame_labels >= 0])
+            for local_id in local_cluster_ids:
+                cmask = frame_labels == local_id
+                cx, cy = x[cmask].mean(), y[cmask].mean()
+
+                # Get tracked global ID
+                global_id = global_id_map.get((frame_id, local_id), local_id)
+                color = tracked_colors[global_id % len(tracked_colors)]
+
+                # Plot cluster points
+                ax2.scatter(x[cmask], y[cmask], c=[color], s=2, alpha=0.8)
+
+                # Add cluster ID label at centroid
+                ax2.annotate(f'{global_id}', (cx, cy), fontsize=9, fontweight='bold',
+                            ha='center', va='center',
+                            bbox=dict(boxstyle='circle,pad=0.3', facecolor=color,
+                                     edgecolor='black', linewidth=0.5, alpha=0.9),
+                            color='white' if sum(color) < 1.5 else 'black')
+
+                cluster_legend_items.append((global_id, color, cmask.sum()))
+
+            num_clusters = len(local_cluster_ids)
+            signal_count = cluster_mask.sum()
+        else:
+            num_clusters = 0
+            noise_count = 0
+            signal_count = len(x)
+
+        ax2.set_xlim(xlim)
+        ax2.set_ylim(ylim)
+        ax2.set_xlabel("X (meters)", fontsize=11)
+        ax2.set_ylabel("Y (meters)", fontsize=11)
+        ax2.set_title(f"ST-DBSCAN Clustered\n{num_clusters} clusters, {noise_count:,} noise points", fontsize=12)
+        ax2.set_aspect('equal')
+        ax2.grid(True, alpha=0.3)
+
+        # Add legend/key outside the plot on the right
+        from matplotlib.patches import Patch
+
+        legend_elements = [
+            Patch(facecolor='lightgray', edgecolor='gray', label='Noise (filtered)'),
+        ]
+        # Add top clusters to legend (sorted by point count)
+        cluster_legend_items.sort(key=lambda x: -x[2])  # Sort by point count descending
+        for global_id, color, count in cluster_legend_items[:10]:  # Show top 10
+            legend_elements.append(
+                Patch(facecolor=color, edgecolor='black', linewidth=0.5,
+                      label=f'Cluster {global_id} ({count:,} pts)')
+            )
+
+        # Place legend outside plot on the right
+        ax2.legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1.02, 0.5),
+                  fontsize=9, framealpha=0.95, title='Legend', title_fontsize=10,
+                  borderaxespad=0)
+
+        # Main title with frame number
+        fig.suptitle(f"Frame {frame_id + 1} of {num_frames}", fontsize=14, fontweight='bold', y=0.98)
+
+        # Adjust layout to make room for legend on right
+        plt.tight_layout(rect=[0, 0, 0.88, 0.95])
+
+        # Save frame
+        frame_path = temp_dir / f"frame_{idx:04d}.png"
+        plt.savefig(frame_path, dpi=150, facecolor='white', edgecolor='none')
+        plt.close()
+        frame_paths.append(frame_path)
+
+        if (idx + 1) % 5 == 0 or idx == num_frames - 1:
+            print(f"    Rendered {idx + 1}/{num_frames} frames...")
+
+    # Combine frames into GIF
+    print("  Combining frames into GIF...")
+    images = [Image.open(fp) for fp in frame_paths]
+
+    # Save GIF
+    gif_path = output_dir / "stdbscan_comparison.gif"
+    images[0].save(
+        gif_path,
+        save_all=True,
+        append_images=images[1:],
+        duration=int(1000 / fps),  # milliseconds per frame
+        loop=0  # infinite loop
+    )
+
+    # Clean up temp frames
+    for fp in frame_paths:
+        fp.unlink()
+    temp_dir.rmdir()
+
+    print(f"Saved: stdbscan_comparison.gif ({num_frames} frames, {total_tracked} tracked clusters)")
+
+
 # =============================================================================
 # PLY Output Functions
 # =============================================================================
@@ -575,11 +861,17 @@ def write_ply(path: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 
 def run_pipeline(data_dir: Path, output_dir: Path,
                  eps_space: float, eps_time: float, min_samples: int,
-                 max_frames: int, no_viz: bool, parallel: bool = True,
-                 low_memory: bool = False) -> None:
+                 min_frames: int, max_frames: int, no_viz: bool,
+                 parallel: bool = True, low_memory: bool = False) -> None:
     """Run the complete ST-DBSCAN denoising pipeline.
 
     Args:
+        eps_space: Spatial clustering radius (meters)
+        eps_time: Temporal clustering window (frames)
+        min_samples: Minimum points to form a cluster
+        min_frames: Minimum number of frames a cluster must span (filters single-frame noise)
+        max_frames: Maximum frames to process (0 = all)
+        no_viz: Skip visualization generation
         parallel: Use multiprocessing for faster CSV loading
         low_memory: Use memory-efficient mode (slower but uses less RAM)
     """
@@ -656,10 +948,10 @@ def run_pipeline(data_dir: Path, output_dir: Path,
 
     # Step 4: Apply ST-DBSCAN
     print("\n[4/5] Applying ST-DBSCAN clustering for denoising...")
-    print(f"  Parameters: eps_space={eps_space}, eps_time={eps_time}, min_samples={min_samples}")
+    print(f"  Parameters: eps_space={eps_space}, eps_time={eps_time}, min_samples={min_samples}, min_frames={min_frames}")
 
     coords = np.column_stack([all_x, all_y])
-    labels = st_dbscan(coords, all_times, eps_space, eps_time, min_samples)
+    labels = st_dbscan(coords, all_times, eps_space, eps_time, min_samples, min_frames)
 
     # Calculate statistics
     noise_mask = labels == -1
@@ -722,11 +1014,9 @@ def run_pipeline(data_dir: Path, output_dir: Path,
     # Generate visualizations
     if not no_viz:
         print("\nGenerating visualizations...")
-        plot_before_after(output_dir, all_x, all_y, all_z,
-                         denoised_x, denoised_y, denoised_z, denoised_labels)
 
         frame_indices = all_times.astype(int)
-        # Reload frames_data if needed for temporal visualization
+        # Reload frames_data if needed for visualization
         if frames_data is None:
             print("  Reloading frame data for visualization...")
             frames_data = load_frames_parallel(frames, MAX_WORKERS) if parallel else [
@@ -734,8 +1024,19 @@ def run_pipeline(data_dir: Path, output_dir: Path,
             ]
             frames_data = [{'x': fd[0], 'y': fd[1], 'z': fd[2]} if isinstance(fd, tuple) else fd
                           for fd in frames_data]
+
+        # Static comparison image
+        plot_before_after(output_dir, all_x, all_y, all_z,
+                         denoised_x, denoised_y, denoised_z, denoised_labels)
+
+        # Temporal cluster visualization
         plot_temporal_clusters(output_dir, frames_data, labels, frame_indices)
+
+        # Noise reduction statistics
         plot_noise_reduction_stats(output_dir, stats)
+
+        # Animated GIF showing frame-by-frame comparison
+        create_comparison_gif(output_dir, frames_data, labels, frame_indices, fps=2)
 
     print("\n" + "=" * 60)
     print("PIPELINE COMPLETE")
@@ -789,6 +1090,7 @@ def quick_run():
         eps_space=DEFAULT_EPS_SPACE,
         eps_time=DEFAULT_EPS_TIME,
         min_samples=DEFAULT_MIN_SAMPLES,
+        min_frames=DEFAULT_MIN_FRAMES,  # Require clusters to span multiple frames
         max_frames=5,  # Just 5 frames for quick visualization
         no_viz=False,  # Generate visualizations
         parallel=False,  # Simpler, less memory
@@ -839,6 +1141,8 @@ Examples:
                        help=f"Temporal clustering window in frames (default: {DEFAULT_EPS_TIME})")
     parser.add_argument("--min-samples", type=int, default=DEFAULT_MIN_SAMPLES,
                        help=f"Minimum points to form a cluster (default: {DEFAULT_MIN_SAMPLES})")
+    parser.add_argument("--min-frames", type=int, default=DEFAULT_MIN_FRAMES,
+                       help=f"Minimum frames a cluster must span to be valid (default: {DEFAULT_MIN_FRAMES})")
     parser.add_argument("--max-frames", type=int, default=5,
                        help="Maximum frames to process (default: 5, 0 = all)")
     parser.add_argument("--no-viz", action="store_true",
@@ -856,6 +1160,7 @@ Examples:
         eps_space=args.eps_space,
         eps_time=args.eps_time,
         min_samples=args.min_samples,
+        min_frames=args.min_frames,
         max_frames=args.max_frames,
         no_viz=args.no_viz,
         parallel=not args.no_parallel,
