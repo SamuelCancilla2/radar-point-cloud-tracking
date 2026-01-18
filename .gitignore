@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data files - large CSVs and point clouds
+*.csv
+*.ply
+*.xyz
+*.las
+*.laz
+*.pcd
+
+# Generated outputs
+tracking_results/
+gain_fused_ply/
+1.5_Folder/
+
+# Archives
+*.zip
+*.tar.gz
+*.7z
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Images (keep source PNGs in certain folders if needed)
+# *.png  # Uncomment if you want to exclude all PNGs
+
+# Logs
+*.log
+
+# Rust build artifacts (if using radar-pipeline-rs)
+radar-pipeline-rs/target/
+Cargo.lock

@@ -1,0 +1,31 @@
+# Radar Pipeline Default Configuration
+
+gains:
+  values: [40, 50, 75]
+  colors:
+    40: [0, 114, 255]    # blue
+    50: [0, 200, 83]     # green
+    75: [255, 87, 34]    # orange
+  z_offsets:
+    75: 0.0      # bottom layer
+    50: 250.0    # middle layer
+    40: 500.0    # top layer
+
+radar:
+  angle_scale: 0.04394785  # 360.0 / 8196.0
+  num_echo_columns: 1024
+  range_bin_width_m: 0.5
+  range_start_m: 0.0
+
+processing:
+  intensity_threshold: 0.0
+  point_stride: 16
+  max_points_per_gain: 10000000
+  max_points_stack: 20000000
+  plot_max_points: 1000000
+
+clustering:
+  eps_space: 5.0
+  eps_time: 1.0
+  min_samples: 10
+  max_points: 10000000

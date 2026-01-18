@@ -1,0 +1,74 @@
+[package]
+name = "radar-pipeline"
+version = "0.1.0"
+edition = "2021"
+authors = ["Samuel Cancilla <scancilla06@gmail.com>"]
+description = "High-performance radar point cloud processing pipeline"
+license = "MIT"
+readme = "README.md"
+keywords = ["radar", "point-cloud", "ply", "clustering", "stdbscan"]
+categories = ["science", "command-line-utilities"]
+
+[dependencies]
+# Parallelization
+rayon = "1.10"
+
+# Numeric computing
+ndarray = { version = "0.16", features = ["rayon", "serde"] }
+ndarray-stats = "0.6"
+
+# Spatial indexing for clustering
+kiddo = "4.2"
+
+# CSV parsing
+csv = "1.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "color"] }
+
+# Progress bars
+indicatif = { version = "0.17", features = ["rayon"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# File globbing
+glob = "0.3"
+
+# Plotting/visualization
+plotters = { version = "0.3", default-features = false, features = ["bitmap_encoder", "line_series", "point_series"] }
+plotters-bitmap = "0.3"
+
+# Regex for parsing
+regex = "1.11"
+
+# Crossbeam for lock-free data structures
+crossbeam = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.14"
+approx = "0.5"
+
+[[bin]]
+name = "radar-pipeline"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+lto = true
+codegen-units = 1
