@@ -1,0 +1,629 @@
+================================================================================
+        RADAR POINT CLOUD PROCESSING AND OBJECT TRACKING PIPELINE
+                        Complete Documentation
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview
+2. Data Format
+3. Pipeline Stages
+4. Individual Program Documentation
+5. How to Run the Complete Pipeline
+6. Parameter Tuning Guide
+7. Output Files Explained
+8. Troubleshooting
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+This pipeline processes marine radar data to:
+  - Convert raw radar sweeps into 3D point clouds
+  - Fuse multiple gain levels (40, 50, 70/75) for better coverage
+  - Detect objects using spatiotemporal clustering (ST-DBSCAN)
+  - Filter out stationary land/background
+  - Classify detected objects as buoys (stationary) or boats (moving)
+  - Track objects across time with persistent IDs
+
+The pipeline consists of several Python scripts that can be run independently
+or as part of a complete workflow.
+
+================================================================================
+2. DATA FORMAT
+================================================================================
+
+INPUT: Raw Radar CSV Files
+--------------------------
+Location: (.125NM)data_pattern3(.125NM)/gain_XX/
+Filename format: YYYYMMDD_HHMMSS_mmm.csv (timestamp with milliseconds)
+
+CSV Columns:
+  Column 0: Status      - Radar status code
+  Column 1: Scale       - Maximum range in meters for this sweep
+  Column 2: Range       - Range setting (0, 1, or 2)
+  Column 3: Gain        - Gain level (40, 50, 70, or 75 dB)
+  Column 4: Angle       - Angle in radar units (0-8196 = 0-360 degrees)
+  Columns 5-1028: Echo_0 to Echo_1023 - Intensity values (0-255) for each range bin
+
+Each row represents one angular sweep. The radar completes ~8196 angles per
+full rotation. Each angle has 1024 range bins extending outward from the radar.
+
+INTERMEDIATE: Cartesian CSV Files
+---------------------------------
+Columns: x, y, z
+  - x, y: Horizontal position in meters (Cartesian coordinates)
+  - z: Intensity value (echo strength)
+
+OUTPUT: PLY Point Cloud Files
+-----------------------------
+ASCII PLY format with RGB colors.
+Properties per point: x, y, z (float), red, green, blue (uint8)
+Can be viewed in CloudCompare, MeshLab, or similar software.
+
+================================================================================
+3. PIPELINE STAGES
+================================================================================
+
+The complete pipeline follows these stages:
+
+  [Raw Radar CSVs]
+         |
+         v
+  STAGE 1: Sort by Gain
+         |
+         v
+  [gain_40/, gain_50/, gain_75/ folders]
+         |
+         v
+  STAGE 2: Filter by Range (optional)
+         |
+         v
+  STAGE 3: Convert to Cartesian
+         |
+         v
+  [Cartesian CSVs with x, y, intensity]
+         |
+         v
+  STAGE 4: Build Point Clouds (PLY)
+         |
+         v
+  [PLY files for visualization]
+         |
+         v
+  STAGE 5: Object Detection & Tracking
+         |
+         v
+  [Tracked objects with classifications]
+
+================================================================================
+4. INDIVIDUAL PROGRAM DOCUMENTATION
+================================================================================
+
+------------------------------------------------------------------------------
+PROGRAM: 0_Sort_Files_By_Gain.py
+Location: (.125NM)data_pattern3(.125NM)/
+------------------------------------------------------------------------------
+
+PURPOSE:
+  Organizes raw radar CSV files into subdirectories based on their gain value.
+
+HOW IT WORKS:
+  1. Reads the 4th column (Gain) from each CSV file
+  2. Creates subdirectories: gain_40/, gain_50/, gain_75/
+  3. Moves each file to the appropriate directory
+
+USAGE:
+  python 0_Sort_Files_By_Gain.py
+
+INPUT:  Raw CSV files in current directory
+OUTPUT: Files moved to gain_XX/ subdirectories
+
+------------------------------------------------------------------------------
+PROGRAM: remove_range_1&2_csvs.py
+Location: (.125NM)data_pattern3(.125NM)/
+------------------------------------------------------------------------------
+
+PURPOSE:
+  Removes CSV files with Range values 1 or 2 (often contain noise/artifacts).
+
+HOW IT WORKS:
+  1. Reads the 3rd column (Range) from each CSV file
+  2. Deletes files where Range equals 1 or 2
+
+USAGE:
+  python remove_range_1&2_csvs.py
+
+INPUT:  CSV files in gain_XX/ directories
+OUTPUT: Files with Range 1 or 2 are deleted
+
+------------------------------------------------------------------------------
+PROGRAM: 1_CSVtoCartesian.py
+Location: PointCloudWork/
+------------------------------------------------------------------------------
+
+PURPOSE:
+  Converts a single radar sweep CSV from polar to Cartesian coordinates.
+
+HOW IT WORKS:
+  1. Reads radar CSV with angle and echo data
+  2. Converts angle from radar units to radians:
+       angle_rad = angle_value * (360 / 8196) * (pi / 180)
+  3. Calculates range for each bin:
+       range = (scale / 1024) * bin_index
+  4. Converts to Cartesian:
+       x = range * cos(angle_rad)
+       y = range * sin(angle_rad)
+       z = intensity (echo value)
+  5. Filters points below intensity threshold
+  6. Saves as CSV with x, y, z columns
+
+USAGE:
+  python 1_CSVtoCartesian.py output.csv --input input.csv --threshold 0.0
+
+INPUT:  Single radar CSV file
+OUTPUT: Cartesian CSV with x, y, z columns
+
+------------------------------------------------------------------------------
+PROGRAM: 2_build_point_clouds.py
+Location: PointCloudWork/
+------------------------------------------------------------------------------
+
+PURPOSE:
+  Builds PLY point cloud files from Cartesian CSV data, combining multiple
+  gain levels into stacked visualizations.
+
+HOW IT WORKS:
+  1. Discovers CSV files named *gain_XX.csv in 1.5_Folder/
+  2. Loads points from each gain level
+  3. Assigns colors by gain:
+       Gain 40: Blue  (0, 114, 255)
+       Gain 50: Green (0, 200, 83)
+       Gain 75: Orange (255, 87, 34)
+  4. Creates two output variants:
+       - Offset stack: Gains separated vertically (Z offsets)
+       - Flat stack: All gains at same Z level
+  5. Applies point stride to reduce file size
+  6. Writes ASCII PLY files
+
+USAGE:
+  python 2_build_point_clouds.py
+
+INPUT:  Cartesian CSV files in 1.5_Folder/
+OUTPUT:
+  - frame_stack_v3.ply (offset stack)
+  - frame_stack_flat_v3.ply (flat stack)
+  - PNG preview images
+
+------------------------------------------------------------------------------
+PROGRAM: 2.5_point_cloud_png_generator.py
+Location: PointCloudWork/
+------------------------------------------------------------------------------
+
+PURPOSE:
+  Generates PNG preview images of PLY point clouds.
+
+HOW IT WORKS:
+  1. Loads PLY file
+  2. Subsamples points for faster rendering
+  3. Creates 3D matplotlib scatter plot
+  4. Saves as PNG image
+
+USAGE:
+  python 2.5_point_cloud_png_generator.py
+
+INPUT:  PLY files
+OUTPUT: PNG preview images
+
+------------------------------------------------------------------------------
+PROGRAM: 3_stdbscan_point_clouds.py
+Location: PointCloudWork/
+------------------------------------------------------------------------------
+
+PURPOSE:
+  Applies ST-DBSCAN (Spatio-Temporal DBSCAN) clustering to point clouds.
+  Uses gain-based colors as a proxy for time.
+
+HOW IT WORKS:
+  1. Loads PLY point cloud with RGB colors
+  2. Infers "time step" from point colors:
+       Blue (gain 40)  -> Time 2
+       Green (gain 50) -> Time 1
+       Orange (gain 75) -> Time 0
+  3. Applies ST-DBSCAN:
+       - Finds spatial neighbors within eps_space radius
+       - Filters by temporal distance (|time_i - time_j| <= eps_time)
+       - Expands clusters using DBSCAN logic
+  4. Outputs cluster labels and visualization
+
+PARAMETERS:
+  EPS_SPACE = 5.0     # Spatial radius in meters
+  EPS_TIME = 1.0      # Temporal threshold
+  MIN_SAMPLES = 10    # Minimum points per cluster
+
+USAGE:
+  python 3_stdbscan_point_clouds.py
+
+INPUT:  PLY files (frame_stack_v3.ply, frame_stack_flat_v3.ply)
+OUTPUT:
+  - *_dbscan_labels.csv (cluster labels per point)
+  - *_dbscan_labels.png (visualization)
+
+------------------------------------------------------------------------------
+PROGRAM: 4_temporal_object_tracker.py  [NEW - MAIN TRACKING SYSTEM]
+Location: PointCloudWork/
+------------------------------------------------------------------------------
+
+PURPOSE:
+  Complete object detection and tracking system that processes time-series
+  radar data to detect, classify, and track objects (buoys and boats).
+
+HOW IT WORKS:
+
+  STEP 1: Discover and Group Files
+    - Scans gain_40/, gain_50/, gain_75/ directories
+    - Parses timestamps from filenames
+    - Groups files from different gains that occur within 2 seconds
+      into "frames" (synchronized radar sweeps)
+
+  STEP 2: Build Point Cloud Frames
+    - For each frame, loads data from all available gains
+    - Converts polar to Cartesian coordinates
+    - Applies intensity threshold filtering
+    - Applies point stride for efficiency
+
+  STEP 3: Land/Background Filtering
+    - Builds occupancy grid across all frames
+    - Counts how often each grid cell is occupied
+    - Cells occupied in >80% of frames are classified as "land"
+    - Removes land points from all frames
+
+  STEP 4: ST-DBSCAN Clustering
+    - Combines all frames into single coordinate array
+    - Applies spatial+temporal DBSCAN:
+      * Spatial neighbors: points within eps_space meters
+      * Temporal neighbors: points within eps_time frames
+      * Both conditions must be met
+    - Returns cluster labels for each point
+
+  STEP 5: Object Tracking
+    - Extracts cluster centroids per frame
+    - Uses Hungarian algorithm to associate clusters across frames
+    - Maintains object state:
+      * Position history
+      * Velocity history
+      * Frames seen
+    - Handles object creation, update, and deletion
+
+  STEP 6: Object Classification
+    - Calculates average velocity over recent frames
+    - Classification rules:
+      * Velocity < 1.0 m/frame -> "buoy" (stationary)
+      * Velocity >= 1.0 m/frame -> "boat" (moving)
+      * Insufficient history -> "unknown"
+
+  STEP 7: Save Results
+    - tracked_objects.csv: Summary of all objects
+    - trajectories.csv: Position history
+    - clusters.csv: Cluster details per frame
+    - Visualization PNGs
+
+PARAMETERS:
+  --eps-space           Spatial clustering radius (default: 8.0 meters)
+  --eps-time            Temporal clustering window (default: 2.0 frames)
+  --min-samples         Minimum points per cluster (default: 15)
+  --intensity-threshold Minimum intensity to keep (default: 10.0)
+  --max-frames          Limit frames to process (default: 0 = all)
+  --no-land-filter      Skip land filtering step
+  --no-viz              Skip visualization generation
+
+USAGE:
+  # Full pipeline with all frames
+  python 4_temporal_object_tracker.py
+
+  # Process first 100 frames
+  python 4_temporal_object_tracker.py --max-frames 100
+
+  # Custom clustering parameters
+  python 4_temporal_object_tracker.py --eps-space 10.0 --min-samples 20
+
+  # Skip land filtering (faster, but more noise)
+  python 4_temporal_object_tracker.py --no-land-filter
+
+INPUT:
+  Directory with gain_40/, gain_50/, gain_75/ subdirectories containing
+  radar CSV files with timestamps in filenames.
+
+OUTPUT:
+  tracking_results/
+    ├── tracked_objects.csv    # Object summary
+    ├── trajectories.csv       # Position history
+    ├── clusters.csv           # Cluster details
+    ├── tracking_summary.png   # Overall visualization
+    └── visualizations/        # Per-frame images
+        ├── frame_0000.png
+        ├── frame_0010.png
+        └── ...
+
+------------------------------------------------------------------------------
+PROGRAM: 5_gain_fusion_ply_builder.py  [NEW - PLY BUILDER]
+Location: PointCloudWork/
+------------------------------------------------------------------------------
+
+PURPOSE:
+  Creates gain-fused PLY point clouds with absolute intensity values.
+  Provides multiple visualization modes for analysis.
+
+HOW IT WORKS:
+
+  MODE 1: Individual Frames
+    - Processes each time frame separately
+    - Fuses all available gains into single point cloud
+    - Z coordinate = intensity (absolute value)
+    - Colors by intensity (blue->green->yellow->red)
+    - Saves separate PLY for each frame
+
+  MODE 2: Temporal Stack
+    - Combines multiple frames into single PLY
+    - Z coordinate = time (frame index * spacing)
+    - Allows viewing temporal evolution in 3D
+    - Good for identifying movement patterns
+
+  MODE 3: Gain Comparison
+    - Processes single frame
+    - Creates separate PLY for each gain level
+    - Creates fused PLY colored by gain
+    - Creates fused PLY colored by intensity
+    - Good for comparing gain sensitivity
+
+PARAMETERS:
+  individual:
+    --max-frames    Maximum frames to process
+    --mode          Fusion mode: "absolute" or "max"
+
+  stacked:
+    --max-frames    Maximum frames to stack
+    --time-spacing  Z spacing between frames (default: 10.0)
+    --mode          Fusion mode: "absolute" or "max"
+
+  comparison:
+    --frame         Frame index to analyze (default: 0)
+
+USAGE:
+  # Build individual frame PLYs
+  python 5_gain_fusion_ply_builder.py individual --max-frames 50
+
+  # Build temporal stack (all frames in one PLY)
+  python 5_gain_fusion_ply_builder.py stacked --max-frames 100
+
+  # Compare gains at frame 0
+  python 5_gain_fusion_ply_builder.py comparison --frame 0
+
+INPUT:
+  Directory with gain_40/, gain_50/, gain_75/ subdirectories
+
+OUTPUT:
+  gain_fused_ply/
+    ├── individual/          # Individual frame PLYs
+    │   ├── frame_0000_gains_40_50_75.ply
+    │   ├── frame_0001_gains_40_50_75.ply
+    │   └── ...
+    ├── stacked/             # Temporal stack
+    │   └── temporal_stack_100frames.ply
+    └── comparison/          # Gain comparison
+        ├── frame_0000_gain_40.ply
+        ├── frame_0000_gain_50.ply
+        ├── frame_0000_gain_75.ply
+        ├── frame_0000_fused_by_gain.ply
+        └── frame_0000_fused_by_intensity.ply
+
+================================================================================
+5. HOW TO RUN THE COMPLETE PIPELINE
+================================================================================
+
+OPTION A: Quick Start (Object Tracking Only)
+--------------------------------------------
+
+If your data is already sorted into gain folders:
+
+  cd PointCloudWork
+  python 4_temporal_object_tracker.py --max-frames 100
+
+This will:
+  - Load 100 frames from all gains
+  - Filter out land
+  - Detect and cluster objects
+  - Track objects across frames
+  - Classify as buoys/boats
+  - Save results to tracking_results/
+
+
+OPTION B: Full Pipeline from Raw Data
+-------------------------------------
+
+Step 1: Sort files by gain (if not already done)
+  cd "(.125NM)data_pattern3(.125NM)"
+  python 0_Sort_Files_By_Gain.py
+
+Step 2: Remove noisy range values (optional)
+  python remove_range_1&2_csvs.py
+
+Step 3: Run object tracking
+  cd ../PointCloudWork
+  python 4_temporal_object_tracker.py
+
+Step 4: Generate additional visualizations (optional)
+  python 5_gain_fusion_ply_builder.py stacked --max-frames 50
+
+
+OPTION C: Legacy Pipeline (Static Point Clouds)
+-----------------------------------------------
+
+For single-frame analysis using the original scripts:
+
+Step 1: Convert radar CSV to Cartesian
+  python 1_CSVtoCartesian.py 1.5_Folder/1.5_TEST_gain_75.csv --input ../gain_75.csv
+
+Step 2: Build stacked point clouds
+  python 2_build_point_clouds.py
+
+Step 3: Run ST-DBSCAN clustering
+  python 3_stdbscan_point_clouds.py
+
+================================================================================
+6. PARAMETER TUNING GUIDE
+================================================================================
+
+CLUSTERING PARAMETERS (eps-space, eps-time, min-samples)
+---------------------------------------------------------
+
+eps-space (default: 8.0 meters)
+  - Defines spatial neighborhood radius
+  - INCREASE if objects are sparse or you're missing detections
+  - DECREASE if clusters are merging together incorrectly
+  - Typical range: 3.0 - 20.0 meters
+
+eps-time (default: 2.0 frames)
+  - Defines temporal neighborhood window
+  - INCREASE to connect objects that appear intermittently
+  - DECREASE if different time periods are merging
+  - Typical range: 1.0 - 5.0 frames
+
+min-samples (default: 15 points)
+  - Minimum points to form a cluster
+  - INCREASE to filter out noise (fewer, more confident detections)
+  - DECREASE to detect smaller objects
+  - Typical range: 5 - 50 points
+
+
+INTENSITY THRESHOLD (default: 10.0)
+-----------------------------------
+  - Minimum echo intensity to keep a point
+  - INCREASE to reduce noise and focus on strong returns
+  - DECREASE to capture weaker signals
+  - Typical range: 5.0 - 50.0
+
+
+LAND FILTERING PARAMETERS (in code)
+-----------------------------------
+
+LAND_PERSISTENCE_THRESHOLD = 0.8
+  - Fraction of frames a cell must appear in to be "land"
+  - INCREASE if moving objects are being filtered as land
+  - DECREASE if land is not being fully removed
+
+LAND_GRID_RESOLUTION = 5.0 meters
+  - Size of grid cells for persistence analysis
+  - INCREASE for faster processing, coarser filtering
+  - DECREASE for finer land boundary detection
+
+
+OBJECT CLASSIFICATION (in code)
+-------------------------------
+
+STATIONARY_VELOCITY_THRESHOLD = 1.0 m/frame
+  - Objects with velocity below this are "buoys"
+  - INCREASE if slow-moving boats are being classified as buoys
+  - DECREASE if stationary objects are being classified as boats
+
+================================================================================
+7. OUTPUT FILES EXPLAINED
+================================================================================
+
+tracked_objects.csv
+-------------------
+Columns:
+  object_id        Unique identifier for the object
+  object_type      Classification: "buoy", "boat", or "unknown"
+  num_frames_seen  Total frames this object was detected
+  first_frame      First frame where object appeared
+  last_frame       Last frame where object was seen
+  avg_velocity     Average velocity in meters/frame
+  final_x          Last known X position (meters)
+  final_y          Last known Y position (meters)
+
+
+trajectories.csv
+----------------
+Columns:
+  object_id        Which object this position belongs to
+  object_type      Classification at time of observation
+  frame_id         Frame number
+  x                X position in meters
+  y                Y position in meters
+
+
+clusters.csv
+------------
+Columns:
+  frame_id         Frame number
+  cluster_id       Cluster identifier within frame
+  num_points       Number of points in cluster
+  centroid_x       Cluster center X position
+  centroid_y       Cluster center Y position
+  mean_intensity   Average intensity of cluster points
+
+
+PLY Files
+---------
+Can be opened in:
+  - CloudCompare (free, recommended)
+  - MeshLab (free)
+  - Blender (free)
+  - MATLAB
+
+Colors indicate:
+  - In tracking visualizations: unique color per object
+  - In gain-fused PLYs: intensity (blue=low, red=high) or gain source
+
+================================================================================
+8. TROUBLESHOOTING
+================================================================================
+
+PROBLEM: "No data files found"
+SOLUTION:
+  - Check that data directory contains gain_40/, gain_50/, gain_75/ folders
+  - Verify CSV files have correct timestamp format: YYYYMMDD_HHMMSS_mmm.csv
+  - Use absolute paths if relative paths don't work
+
+PROBLEM: Too few objects detected
+SOLUTION:
+  - Decrease min-samples parameter
+  - Decrease intensity-threshold
+  - Increase eps-space
+  - Check if land filter is too aggressive (try --no-land-filter)
+
+PROBLEM: Too many objects / noise
+SOLUTION:
+  - Increase min-samples parameter
+  - Increase intensity-threshold
+  - Decrease eps-space
+  - Ensure land filtering is enabled
+
+PROBLEM: Objects not being tracked across frames
+SOLUTION:
+  - Increase eps-time parameter
+  - Increase MAX_ASSOCIATION_DISTANCE in code (default: 50 meters)
+  - Check if objects are moving faster than expected
+
+PROBLEM: All objects classified as "unknown"
+SOLUTION:
+  - Process more frames (need MOTION_HISTORY_FRAMES = 5 minimum)
+  - Objects need to be tracked for several frames before classification
+
+PROBLEM: Memory errors with large datasets
+SOLUTION:
+  - Use --max-frames to limit processing
+  - Increase POINT_STRIDE in code to reduce points
+  - Process in batches
+
+PROBLEM: Slow processing
+SOLUTION:
+  - Use --no-viz to skip visualization generation
+  - Increase POINT_STRIDE
+  - Reduce --max-frames for testing
+  - Use the Rust implementation (radar-pipeline-rs) for better performance
+
+================================================================================
+                            END OF DOCUMENTATION
+================================================================================
