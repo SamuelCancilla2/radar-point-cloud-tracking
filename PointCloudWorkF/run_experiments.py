@@ -16,6 +16,15 @@ from pathlib import Path
 from datetime import datetime
 import shutil
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
 # =============================================================================
 # EASY CONFIGURATION - Change these values to customize your run
 # =============================================================================
@@ -71,6 +80,7 @@ FULL_EXPERIMENTS = [
 # Select which experiments to run based on mode
 EXPERIMENTS = [QUICK_EXPERIMENT] if QUICK_MODE else FULL_EXPERIMENTS
 
+
 def run_experiment(exp: dict, script_dir: Path, max_frames: int = 0) -> dict:
     """Run a single experiment and return results."""
 
@@ -88,7 +98,7 @@ def run_experiment(exp: dict, script_dir: Path, max_frames: int = 0) -> dict:
         "--output-dir", str(output_dir),
         "--no-parallel",  # More stable, uses less memory
         "--low-memory",   # Free intermediate data to reduce RAM
-        "--no-viz",       # Skip visualization to save RAM
+        # Visualizations enabled - generates PNGs for each experiment
     ]
 
     print(f"\n{'='*60}")
@@ -101,7 +111,8 @@ def run_experiment(exp: dict, script_dir: Path, max_frames: int = 0) -> dict:
     # Time the run
     start_time = time.time()
     try:
-        result = subprocess.run(cmd, cwd=script_dir, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, cwd=script_dir,
+                                capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
         print("  TIMEOUT after 600s")
         result = type('obj', (object,), {'stdout': '', 'stderr': 'TIMEOUT'})()
@@ -238,7 +249,7 @@ with {most_clusters['num_clusters']} clusters identified.
 The fastest experiment was \\textbf{{{fastest['name'].replace('_', '\\_')}}}
 completing in {fastest['elapsed_seconds']:.1f} seconds.
 
-\subsection{{Recommendations}}
+\\subsection{{Recommendations}}
 Based on these results:
 \\begin{{itemize}}
     \\item For \\textbf{{maximum noise removal}}: Use the ``{best_noise['name'].replace('_', '\\_')}'' configuration
@@ -269,14 +280,156 @@ Based on these results:
     print(f"LaTeX report written to: {output_path}")
 
 
+def generate_summary_pngs(results: list, script_dir: Path):
+    """Generate summary PNG visualizations comparing all experiments."""
+    if not HAS_MPL:
+        print("matplotlib not available, skipping summary visualizations")
+        return
+
+    print("\nGenerating summary comparison PNGs...")
+
+    # 1. Bar chart comparing noise reduction across experiments
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    names = [r['name'].replace('_', '\n') for r in results]
+    x = np.arange(len(names))
+
+    # Noise reduction percentage
+    ax1 = axes[0]
+    noise_pcts = [r['noise_pct'] for r in results]
+    bars1 = ax1.bar(x, noise_pcts, color='#e74c3c', edgecolor='black')
+    ax1.set_xlabel('Experiment')
+    ax1.set_ylabel('Noise Removed (%)')
+    ax1.set_title('Noise Reduction by Parameter Set')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(names, fontsize=9)
+    for bar, val in zip(bars1, noise_pcts):
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.2,
+                f'{val:.1f}%', ha='center', va='bottom', fontsize=10)
+
+    # Number of clusters found
+    ax2 = axes[1]
+    clusters = [r['num_clusters'] for r in results]
+    bars2 = ax2.bar(x, clusters, color='#9b59b6', edgecolor='black')
+    ax2.set_xlabel('Experiment')
+    ax2.set_ylabel('Number of Clusters')
+    ax2.set_title('Clusters Detected by Parameter Set')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(names, fontsize=9)
+    for bar, val in zip(bars2, clusters):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.2,
+                f'{val}', ha='center', va='bottom', fontsize=10)
+
+    # Signal points retained
+    ax3 = axes[2]
+    signal_pts = [r['signal_points'] for r in results]
+    bars3 = ax3.bar(x, signal_pts, color='#2ecc71', edgecolor='black')
+    ax3.set_xlabel('Experiment')
+    ax3.set_ylabel('Signal Points Retained')
+    ax3.set_title('Signal Points by Parameter Set')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(names, fontsize=9)
+    for bar, val in zip(bars3, signal_pts):
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(signal_pts)*0.01,
+                f'{val:,}', ha='center', va='bottom', fontsize=9)
+
+    plt.tight_layout()
+    comparison_path = script_dir / "experiment_comparison.png"
+    plt.savefig(comparison_path, dpi=200)
+    plt.close()
+    print(f"Saved: {comparison_path}")
+
+    # 2. Parameter vs Results scatter/bubble chart
+    if len(results) > 1:
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        eps_space = [r['eps_space'] for r in results]
+        min_samples = [r['min_samples'] for r in results]
+        noise_pcts = [r['noise_pct'] for r in results]
+        clusters = [r['num_clusters'] for r in results]
+
+        # Bubble size based on clusters, color based on noise reduction
+        scatter = ax.scatter(eps_space, min_samples,
+                           s=[c*50 + 100 for c in clusters],  # size by clusters
+                           c=noise_pcts, cmap='RdYlGn_r',  # color by noise %
+                           edgecolors='black', linewidth=1.5, alpha=0.7)
+
+        # Add labels for each point
+        for i, r in enumerate(results):
+            ax.annotate(r['name'], (eps_space[i], min_samples[i]),
+                       xytext=(5, 5), textcoords='offset points', fontsize=9)
+
+        ax.set_xlabel('Spatial Radius (eps_space)', fontsize=11)
+        ax.set_ylabel('Min Samples', fontsize=11)
+        ax.set_title('Parameter Space Exploration\n(bubble size = clusters, color = noise %)', fontsize=12)
+        cbar = plt.colorbar(scatter, ax=ax, label='Noise Removed (%)')
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        param_path = script_dir / "parameter_exploration.png"
+        plt.savefig(param_path, dpi=200)
+        plt.close()
+        print(f"Saved: {param_path}")
+
+    # 3. Summary table as image
+    fig, ax = plt.subplots(figsize=(12, max(3, len(results) * 0.8 + 2)))
+    ax.axis('off')
+
+    table_data = []
+    headers = ['Experiment', 'eps_space', 'eps_time', 'min_samples', 'min_frames',
+               'Noise %', 'Clusters', 'Signal Pts', 'Time (s)']
+
+    for r in results:
+        table_data.append([
+            r['name'],
+            f"{r['eps_space']:.1f}",
+            f"{r['eps_time']:.1f}",
+            str(r['min_samples']),
+            str(r['min_frames']),
+            f"{r['noise_pct']:.1f}%",
+            str(r['num_clusters']),
+            f"{r['signal_points']:,}",
+            f"{r['elapsed_seconds']:.1f}"
+        ])
+
+    table = ax.table(cellText=table_data, colLabels=headers, loc='center',
+                    cellLoc='center', colColours=['#3498db']*len(headers))
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.8)
+
+    # Style header row
+    for i in range(len(headers)):
+        table[(0, i)].set_text_props(color='white', fontweight='bold')
+
+    # Highlight best results
+    if len(results) > 1:
+        best_noise_idx = max(range(len(results)), key=lambda i: results[i]['noise_pct'])
+        best_cluster_idx = max(range(len(results)), key=lambda i: results[i]['num_clusters'])
+        table[(best_noise_idx + 1, 5)].set_facecolor('#c8e6c9')  # light green
+        table[(best_cluster_idx + 1, 6)].set_facecolor('#c8e6c9')
+
+    ax.set_title('Experiment Results Summary', fontsize=14, fontweight='bold', pad=20)
+
+    plt.tight_layout()
+    summary_path = script_dir / "results_summary_table.png"
+    plt.savefig(summary_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {summary_path}")
+
+    print("Summary PNGs generated successfully!")
+
+
 def main():
     script_dir = Path(__file__).resolve().parent
 
     print("="*60)
     print("ST-DBSCAN PARAMETER COMPARISON EXPERIMENTS")
     print("="*60)
-    print(f"Mode: {'QUICK (single experiment)' if QUICK_MODE else 'FULL (all experiments)'}")
-    print(f"Running {len(EXPERIMENTS)} experiment(s) on {MAX_FRAMES} frames each")
+    print(
+        f"Mode: {'QUICK (single experiment)' if QUICK_MODE else 'FULL (all experiments)'}")
+    print(
+        f"Running {len(EXPERIMENTS)} experiment(s) on {MAX_FRAMES} frames each")
     print("="*60)
 
     results = []
@@ -302,6 +455,9 @@ def main():
     report_path = script_dir / "stdbscan_comparison_report.tex"
     generate_latex_report(results, report_path)
 
+    # Generate summary PNG visualizations
+    generate_summary_pngs(results, script_dir)
+
     # Save JSON results
     with open(script_dir / "experiment_results.json", "w") as f:
         json.dump(results, f, indent=2)
@@ -309,6 +465,15 @@ def main():
     print(f"\nResults saved to:")
     print(f"  - {report_path}")
     print(f"  - {script_dir / 'experiment_results.json'}")
+    print(f"  - {script_dir / 'experiment_comparison.png'}")
+    print(f"  - {script_dir / 'results_summary_table.png'}")
+    if len(results) > 1:
+        print(f"  - {script_dir / 'parameter_exploration.png'}")
+    print(f"\nEach experiment folder also contains:")
+    print(f"  - denoising_comparison.png (raw vs denoised)")
+    print(f"  - noise_reduction_stats.png (pie/bar charts)")
+    print(f"  - temporal_clusters.png (clusters across frames)")
+    print(f"  - stdbscan_comparison.gif (animated comparison)")
 
 
 if __name__ == "__main__":
