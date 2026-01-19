@@ -16,6 +16,34 @@ from pathlib import Path
 from datetime import datetime
 import shutil
 
+# =============================================================================
+# DEPENDENCY CHECK - Install missing packages automatically
+# =============================================================================
+
+def check_and_install_dependencies():
+    """Check for required packages and install if missing."""
+    required = ['numpy', 'pandas', 'matplotlib', 'scikit-learn', 'pillow']
+    missing = []
+
+    for package in required:
+        try:
+            if package == 'pillow':
+                __import__('PIL')
+            elif package == 'scikit-learn':
+                __import__('sklearn')
+            else:
+                __import__(package)
+        except ImportError:
+            missing.append(package)
+
+    if missing:
+        print(f"Installing missing packages: {', '.join(missing)}")
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet'] + missing)
+        print("Dependencies installed successfully!\n")
+
+# Run dependency check on import
+check_and_install_dependencies()
+
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -33,7 +61,7 @@ except ImportError:
 MAX_FRAMES = 10
 
 # Set to True for a quick single test, False to run all experiments
-QUICK_MODE = True
+QUICK_MODE = False
 
 # =============================================================================
 # EXPERIMENT DEFINITIONS
@@ -98,7 +126,7 @@ def run_experiment(exp: dict, script_dir: Path, max_frames: int = 0) -> dict:
         "--output-dir", str(output_dir),
         "--no-parallel",  # More stable, uses less memory
         "--low-memory",   # Free intermediate data to reduce RAM
-        # Visualizations enabled - generates PNGs for each experiment
+        "--skip-gif",     # Skip slow GIF generation, keep fast PNGs
     ]
 
     print(f"\n{'='*60}")
@@ -107,25 +135,35 @@ def run_experiment(exp: dict, script_dir: Path, max_frames: int = 0) -> dict:
           f"min_samples={exp['min_samples']}, min_frames={exp['min_frames']}")
     print(f"Output: {output_dir.name}")
     print('='*60)
+    sys.stdout.flush()  # Ensure output is displayed immediately
 
-    # Time the run
+    # Time the run - stream output live so user sees progress
     start_time = time.time()
     try:
-        result = subprocess.run(cmd, cwd=script_dir,
-                                capture_output=True, text=True, timeout=600)
+        # Stream output live instead of capturing
+        process = subprocess.Popen(
+            cmd, cwd=script_dir,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1
+        )
+        output_lines = []
+        for line in process.stdout:
+            print(f"  {line}", end='')  # Print live with indent
+            sys.stdout.flush()
+            output_lines.append(line)
+        process.wait(timeout=600)
+        output = ''.join(output_lines)
     except subprocess.TimeoutExpired:
         print("  TIMEOUT after 600s")
-        result = type('obj', (object,), {'stdout': '', 'stderr': 'TIMEOUT'})()
+        process.kill()
+        output = 'TIMEOUT'
     end_time = time.time()
 
     elapsed = end_time - start_time
+    print(f"\n  Completed in {elapsed:.1f} seconds")
 
     # Force garbage collection to free memory
     gc.collect()
-
-    # Parse output for statistics
-    output = result.stdout + result.stderr
-    print(output)
 
     # Extract stats from output
     stats = {
@@ -286,7 +324,11 @@ def generate_summary_pngs(results: list, script_dir: Path):
         print("matplotlib not available, skipping summary visualizations")
         return
 
-    print("\nGenerating summary comparison PNGs...")
+    print("\n" + "="*60)
+    print("GENERATING SUMMARY VISUALIZATIONS")
+    print("="*60)
+    print("Creating comparison charts...")
+    sys.stdout.flush()
 
     # 1. Bar chart comparing noise reduction across experiments
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -426,17 +468,24 @@ def main():
     print("="*60)
     print("ST-DBSCAN PARAMETER COMPARISON EXPERIMENTS")
     print("="*60)
-    print(
-        f"Mode: {'QUICK (single experiment)' if QUICK_MODE else 'FULL (all experiments)'}")
-    print(
-        f"Running {len(EXPERIMENTS)} experiment(s) on {MAX_FRAMES} frames each")
+    print(f"Mode: {'QUICK (single experiment)' if QUICK_MODE else 'FULL (all experiments)'}")
+    print(f"Running {len(EXPERIMENTS)} experiment(s) on {MAX_FRAMES} frames each")
     print("="*60)
+    print("\nExperiments to run:")
+    for i, exp in enumerate(EXPERIMENTS):
+        print(f"  {i+1}. {exp['name']}: eps_space={exp['eps_space']}, min_samples={exp['min_samples']}")
+    print("\nStarting experiments...\n")
+    sys.stdout.flush()
 
     results = []
     total_start = time.time()
 
     for i, exp in enumerate(EXPERIMENTS):
-        print(f"\n[Experiment {i+1}/{len(EXPERIMENTS)}]")
+        remaining = len(EXPERIMENTS) - i
+        print(f"\n{'#'*60}")
+        print(f"# EXPERIMENT {i+1}/{len(EXPERIMENTS)} - {remaining} remaining")
+        print(f"{'#'*60}")
+        sys.stdout.flush()
         stats = run_experiment(exp, script_dir, max_frames=MAX_FRAMES)
         results.append(stats)
 
@@ -473,7 +522,10 @@ def main():
     print(f"  - denoising_comparison.png (raw vs denoised)")
     print(f"  - noise_reduction_stats.png (pie/bar charts)")
     print(f"  - temporal_clusters.png (clusters across frames)")
-    print(f"  - stdbscan_comparison.gif (animated comparison)")
+
+    print("\n" + "="*60)
+    print("SUCCESS! All experiments completed and visualizations generated.")
+    print("="*60)
 
 
 if __name__ == "__main__":

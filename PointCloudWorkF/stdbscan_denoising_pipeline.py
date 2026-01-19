@@ -862,7 +862,8 @@ def write_ply(path: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 def run_pipeline(data_dir: Path, output_dir: Path,
                  eps_space: float, eps_time: float, min_samples: int,
                  min_frames: int, max_frames: int, no_viz: bool,
-                 parallel: bool = True, low_memory: bool = False) -> None:
+                 skip_gif: bool = True, parallel: bool = True,
+                 low_memory: bool = False) -> None:
     """Run the complete ST-DBSCAN denoising pipeline.
 
     Args:
@@ -1035,8 +1036,9 @@ def run_pipeline(data_dir: Path, output_dir: Path,
         # Noise reduction statistics
         plot_noise_reduction_stats(output_dir, stats)
 
-        # Animated GIF showing frame-by-frame comparison
-        create_comparison_gif(output_dir, frames_data, labels, frame_indices, fps=2)
+        # Animated GIF showing frame-by-frame comparison (slow, skip by default)
+        if not skip_gif:
+            create_comparison_gif(output_dir, frames_data, labels, frame_indices, fps=2)
 
     print("\n" + "=" * 60)
     print("PIPELINE COMPLETE")
@@ -1147,6 +1149,8 @@ Examples:
                        help="Maximum frames to process (default: 5, 0 = all)")
     parser.add_argument("--no-viz", action="store_true",
                        help="Skip visualization generation")
+    parser.add_argument("--skip-gif", action="store_true",
+                       help="Skip GIF generation (much faster, still creates PNGs)")
     parser.add_argument("--no-parallel", action="store_true",
                        help="Disable parallel CSV loading (uses less memory)")
     parser.add_argument("--low-memory", action="store_true",
@@ -1163,6 +1167,7 @@ Examples:
         min_frames=args.min_frames,
         max_frames=args.max_frames,
         no_viz=args.no_viz,
+        skip_gif=args.skip_gif,
         parallel=not args.no_parallel,
         low_memory=args.low_memory
     )
